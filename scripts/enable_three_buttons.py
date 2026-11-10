@@ -88,6 +88,39 @@ for indent in (" " * 16, " " * 20):
            f'{indent}    push(db, c, {{"kind": "text", "text": "🔧 Доступ к счёту — в разработке."}})')
     replace_once(old, new, "кнопки " + str(len(indent)))
 
+# Repeated /start should show the updated menu without resetting the user.
+replace_once(
+    '                if text in ("/start", "/help", "Материалы", "/materials"):',
+    '                if text == "/start" and not initial:\n'
+    '                    push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})\n'
+    '                if text in ("/start", "/help", "Материалы", "/materials"):',
+    "повторный запуск Telegram",
+)
+replace_once(
+    '            if text in ("/start", "/help"):\n                db.commit()',
+    '            if text == "/start" and not initial:\n'
+    '                push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})\n'
+    '            if text in ("/start", "/help"):\n                db.commit()',
+    "повторный запуск MAX",
+)
+
+# On re-opening an existing MAX bot, resend greeting on bot_started.
+begin = s.index("    async def on_max(")
+end = s.index("    async def client_message(", begin)
+max_part = s[begin:end]
+start_idx = max_part.index('            if t == "bot_started":')
+stop_idx = max_part.index('                return', start_idx) + len('                return')
+start_block = max_part[start_idx:stop_idx]
+if 'push(db, c, {"kind": "welcome"' not in start_block:
+    max_part = max_part[:start_idx] + start_block.replace(
+        '            if t == "bot_started":',
+        '            if t == "bot_started":\n'
+        '                if not initial:\n'
+        '                    push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})',
+        1,
+    ) + max_part[stop_idx:]
+    s = s[:begin] + max_part + s[end:]
+
 replace_once("keyboard=tg_menu(self.settings.ui_language)",
              "keyboard=funnel_tg_menu()", "приветствие Telegram")
 replace_once("buttons=max_menu(self.settings.ui_language)",
