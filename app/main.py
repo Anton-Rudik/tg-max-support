@@ -139,8 +139,9 @@ async def worker_loop(app):
             inbound_done = await handle_inbound_once(app)
             outbound_done = await handle_outbound_once(app)
             if outbound_done:
-                # MAX permits at most 2 messages/s to one chat; serialized sends keep within limit.
-                await asyncio.sleep(0.55)
+                # Keep a conservative pace for Telegram (~1 message/s per chat)
+                # and for MAX video/material deliveries.
+                await asyncio.sleep(1.05)
             elif not inbound_done:
                 await asyncio.sleep(0.6)
         except asyncio.CancelledError:
