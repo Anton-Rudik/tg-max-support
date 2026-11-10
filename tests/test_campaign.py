@@ -1,4 +1,4 @@
-"""Funnel semantics: reusable Telegram file IDs and gated video CTA."""
+"""Funnel semantics: text strategy, three automatic videos, gated video CTA."""
 import json
 from pathlib import Path
 
@@ -40,9 +40,11 @@ def fixture_db():
     return engine, sessions, settings
 
 
-def seed_videos(db):
+def seed_funnel(db):
     draft = version(db, False)
-    for index in range(4):
+    db.add(Material(version_id=draft.id, position=10, kind="text",
+                    text="⚡️ Авторская стратегия 50.01%\n\nПолный текст стратегии без изображения."))
+    for index in range(1, 4):
         db.add(Material(version_id=draft.id, position=(index + 1) * 10,
                         kind="video", text=f"Видео {index}", filename=f"v{index}.mp4",
                         filepath=json.dumps({"tg_file_id": f"TELEGRAM_ID_{index}"})))
@@ -52,16 +54,19 @@ def seed_videos(db):
     publish(db)
 
 
-def test_campaign_first_four_then_button_then_last_video():
+def test_campaign_text_then_three_videos_then_button_then_last_video():
     engine, sessions, _ = fixture_db()
     with sessions.begin() as db:
-        seed_videos(db)
+        seed_funnel(db)
         user = get_contact(db, "tg", 999, "Клиент")
         assert enqueue_welcome(db, user)
     with sessions() as db:
         jobs = db.scalars(select(Outbound).order_by(Outbound.id)).all()
         assert [j.payload["kind"] for j in jobs] == ["welcome"] + ["material"] * 4 + ["campaign_cta"]
         assert jobs[-1].payload["button"] == "Посмотреть"
+        sequence = [db.get(Material, job.payload["material_id"]).kind
+                    for job in jobs if job.payload["kind"] == "material"]
+        assert sequence == ["text", "video", "video", "video"]
         queue_materials(db, user, gated=True)
         db.commit()
     with sessions() as db:
@@ -77,11 +82,11 @@ async def test_large_video_ref_does_not_trigger_download_or_forward():
     tg, mx = FakeTelegram(), FakeMax()
     svc = SupportService(sessions, tg, mx, settings)
     with sessions.begin() as db:
-        seed_videos(db)
+        seed_funnel(db)
     with sessions() as db:
         m = db.scalar(select(Material).where(Material.kind == "video").limit(1))
         await svc.send_tg_material(999, m)
-    assert tg.sent_media[0] == (999, "video", "TELEGRAM_ID_0", "Видео 0")
+    assert tg.sent_media[0] == (999, "video", "TELEGRAM_ID_1", "Видео 1")
     engine.dispose()
 
 
@@ -91,7 +96,7 @@ async def test_max_needs_local_optimized_video(tmp_path):
     tg, mx = FakeTelegram(), FakeMax()
     svc = SupportService(sessions, tg, mx, settings)
     with sessions.begin() as db:
-        seed_videos(db)
+        seed_funnel(db)
         user = get_contact(db, "max", 909, "Клиент")
         m = db.scalar(select(Material).where(Material.kind == "video").limit(1))
         path = tmp_path / "v0.mp4"
@@ -111,11 +116,29 @@ async def test_campaign_button_routes_to_gated_material():
     tg, mx = FakeTelegram(), FakeMax()
     svc = SupportService(sessions, tg, mx, settings)
     with sessions.begin() as db:
-        seed_videos(db)
+        seed_funnel(db)
         get_contact(db, "tg", 999, "Клиент")
     await svc.on_tg_callback({"id": "callback001", "from": {"id": 999}, "data": "client:watch_more"})
     with sessions() as db:
         jobs = db.scalars(select(Outbound).order_by(Outbound.id)).all()
         assert len(jobs) == 1
         assert db.get(Material, jobs[0].payload["material_id"]).kind == "gated_video"
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_strategy_is_only_text_on_telegram_and_max():
+    engine, sessions, settings = fixture_db()
+    tg, mx = FakeTelegram(), FakeMax()
+    svc = SupportService(sessions, tg, mx, settings)
+    with sessions.begin() as db:
+        seed_funnel(db)
+        max_contact = get_contact(db, "max", 909, "Клиент")
+        strategy = db.scalar(select(Material).where(Material.kind == "text").limit(1))
+        await svc.send_tg_material(999, strategy)
+        await svc.deliver_max(db, max_contact, {"kind": "material", "material_id": strategy.id})
+    assert tg.sent_media == []
+    assert tg.sent_messages[0][1].startswith("⚡️ Авторская стратегия")
+    assert mx.uploaded == []
+    assert mx.sent[0][1] == tg.sent_messages[0][1]
     engine.dispose()
