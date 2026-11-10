@@ -88,38 +88,59 @@ for indent in (" " * 16, " " * 20):
            f'{indent}    push(db, c, {{"kind": "text", "text": "🔧 Доступ к счёту — в разработке."}})')
     replace_once(old, new, "кнопки " + str(len(indent)))
 
-# Repeated /start should show the updated menu without resetting the user.
-replace_once(
-    '                if text in ("/start", "/help", "Материалы", "/materials"):',
-    '                if text == "/start" and not initial:\n'
-    '                    push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})\n'
-    '                if text in ("/start", "/help", "Материалы", "/materials"):',
-    "повторный запуск Telegram",
-)
-replace_once(
-    '            if text in ("/start", "/help"):\n                db.commit()',
-    '            if text == "/start" and not initial:\n'
-    '                push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})\n'
-    '            if text in ("/start", "/help"):\n                db.commit()',
-    "повторный запуск MAX",
+# Support server versions with additional MAX commands (/max_link, /max_video)
+# by injecting /start handling immediately after text is extracted.
+def inject_after_in_method(start_anchor, end_anchor, needle, addition, name):
+    global s
+    begin = s.find(start_anchor)
+    end = s.find(end_anchor, begin + 1) if begin >= 0 else -1
+    if begin < 0 or end < 0:
+        raise SystemExit(f"Не найдена функция {name}. Ничего не изменено.")
+    section = s[begin:end]
+    if section.count(needle) != 1:
+        raise SystemExit(f"Не удалось найти ввод текста в {name}. Ничего не изменено.")
+    s = s[:begin] + section.replace(needle, needle + addition, 1) + s[end:]
+
+
+inject_after_in_method(
+    "    async def on_tg(self, data):",
+    "    async def on_tg_callback(",
+    '                text = msg.get("text", "")',
+    '\n                if text == "/start":\n'
+    '                    if not initial:\n'
+    '                        push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})\n'
+    '                    db.commit()\n'
+    '                    return',
+    "Telegram /start",
 )
 
-# On re-opening an existing MAX bot, resend greeting on bot_started.
-begin = s.index("    async def on_max(")
+inject_after_in_method(
+    "    async def on_max(self, event):",
+    "    async def client_message(",
+    '            text = body.get("text") or ""',
+    '\n            if text == "/start":\n'
+    '                if not initial:\n'
+    '                    push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})\n'
+    '                db.commit()\n'
+    '                return',
+    "MAX /start",
+)
+
+# A bot_started event from MAX should likewise re-send menu to an existing contact.
+begin = s.index("    async def on_max(self, event):")
 end = s.index("    async def client_message(", begin)
-max_part = s[begin:end]
-start_idx = max_part.index('            if t == "bot_started":')
-stop_idx = max_part.index('                return', start_idx) + len('                return')
-start_block = max_part[start_idx:stop_idx]
-if 'push(db, c, {"kind": "welcome"' not in start_block:
-    max_part = max_part[:start_idx] + start_block.replace(
-        '            if t == "bot_started":',
-        '            if t == "bot_started":\n'
-        '                if not initial:\n'
-        '                    push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})',
+part = s[begin:end]
+needle = '            if t == "bot_started":'
+if part.count(needle) != 1:
+    raise SystemExit("Не найден обработчик MAX bot_started. Ничего не изменено.")
+if '                if not initial:\n                    push(db, c, {"kind": "welcome"' not in part:
+    part = part.replace(
+        needle,
+        needle + '\n                if not initial:\n'
+                 '                    push(db, c, {"kind": "welcome", "text": setting(db, "welcome")})',
         1,
-    ) + max_part[stop_idx:]
-    s = s[:begin] + max_part + s[end:]
+    )
+    s = s[:begin] + part + s[end:]
 
 replace_once("keyboard=tg_menu(self.settings.ui_language)",
              "keyboard=funnel_tg_menu()", "приветствие Telegram")
