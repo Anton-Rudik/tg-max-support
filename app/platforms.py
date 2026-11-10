@@ -113,7 +113,7 @@ class MaxAPI:
     async def callback_answer(self, callback_id):
         return await self.call("POST", "/answers", {"callback_id": callback_id}, {})
 
-    async def upload(self, kind, content: bytes, filename="file"):
+    async def upload(self, kind, content: bytes | Path, filename="file"):
         remote_kind = MAX_UPLOAD_TYPES.get(kind, "file")
         start = await self.call("POST", "/uploads", {"type": remote_kind})
         upload_url = start.get("url")
@@ -124,7 +124,12 @@ class MaxAPI:
         if not (host == "oneme.ru" or host.endswith(".oneme.ru") or
                 host == "max.ru" or host.endswith(".max.ru")):
             raise PlatformError("Unexpected MAX upload host", False)
-        r = await self.http.post(upload_url, files={"data": (filename[:200], content)}, timeout=120)
+        if isinstance(content, Path):
+            # Stream a local MAX-optimized video; never load 250 MB in RAM.
+            with content.open("rb") as source:
+                r = await self.http.post(upload_url, files={"data": (filename[:200], source)}, timeout=600)
+        else:
+            r = await self.http.post(upload_url, files={"data": (filename[:200], content)}, timeout=120)
         if r.status_code >= 400:
             raise PlatformError(f"MAX upload error {r.status_code}", r.status_code >= 500)
         result = r.json()

@@ -111,3 +111,7 @@ See [SECURITY.md](SECURITY.md) before any public deployment and [CONTRIBUTING.md
 ## License
 
 [MIT](LICENSE) — usable and modifiable by individuals and organizations.
+
+## Optional multi-video campaign
+
+The admin can publish an ordered set of regular video materials followed by a gated video shown only after pressing a configurable CTA button. Large Telegram videos reuse their per-bot `file_id` (new messages, not forwarded posts). MAX videos should be optimized to 250 MB or less; upload alternative MP4 files to the private server, not GitHub. See the [Russian example](docs/VIDEO_FUNNEL_RU.md).

@@ -1,4 +1,5 @@
 import logging
+import json
 import re
 import uuid
 from datetime import timedelta
@@ -14,6 +15,41 @@ from .platforms import tg_attachment, max_attachment, tg_menu, max_menu, client_
 
 log = logging.getLogger(__name__)
 MAX_SIZE = 20 * 1024 * 1024
+MAX_VIDEO_SIZE = 250 * 1024 * 1024
+
+
+def media_kind(material):
+    return material.kind.removeprefix("gated_")
+
+
+def material_refs(material):
+    """Reuse legacy on-disk materials and versioned multi-platform references."""
+    if not material.filepath:
+        return {}
+    if material.filepath.startswith("{"):
+        try:
+            return json.loads(material.filepath)
+        except (ValueError, TypeError):
+            return {}
+    return {"local_path": material.filepath}
+
+
+def set_material_refs(material, **updates):
+    refs = material_refs(material)
+    refs.update(updates)
+    material.filepath = json.dumps(refs, ensure_ascii=False)
+
+
+def local_material_path(material, for_max=False):
+    refs = material_refs(material)
+    value = refs.get("max_path") if for_max else refs.get("local_path")
+    if for_max and not value:
+        value = refs.get("local_path")
+    return Path(value) if value else None
+
+
+def is_gated(material):
+    return material.kind.startswith("gated_")
 
 
 def allowed(db, uid):
@@ -50,10 +86,16 @@ def push(db, contact, payload):
     db.add(Outbound(contact_id=contact.id, payload=payload))
 
 
-def queue_materials(db, contact, v=None):
+def queue_materials(db, contact, v=None, gated=False):
     v = v or version(db, True)
-    for m in materials(db, v):
-        push(db, contact, {"kind": "material", "material_id": m.id})
+    entries = materials(db, v)
+    for m in entries:
+        if is_gated(m) == gated:
+            push(db, contact, {"kind": "material", "material_id": m.id})
+    if not gated and any(is_gated(m) for m in entries):
+        push(db, contact, {"kind": "campaign_cta",
+                           "text": setting(db, "campaign_cta", "Хотите узнать больше о нашем клубе? Посмотрите дополнительное видео."),
+                           "button": setting(db, "campaign_button", "Посмотреть")})
 
 
 def enqueue_welcome(db, contact):
@@ -208,6 +250,8 @@ class SupportService:
                 action = cb.get("payload")
                 if action == "client:materials":
                     queue_materials(db, c)
+                elif action == "client:watch_more":
+                    queue_materials(db, c, gated=True)
                 elif action == "client:contact":
                     push(db, c, {"kind": "text", "text": client_text(self.settings.ui_language, "prompt")})
                 db.commit()
@@ -290,6 +334,8 @@ class SupportService:
                 if c:
                     if action == "client:materials":
                         queue_materials(db, c)
+                    elif action == "client:watch_more":
+                        queue_materials(db, c, gated=True)
                     elif action == "client:contact":
                         push(db, c, {"kind": "text", "text": client_text(self.settings.ui_language, "prompt")})
                     db.commit()
@@ -366,6 +412,31 @@ class SupportService:
                 db.delete(db.get(Staff, mid))
                 await self.tg.message(int(uid), f"Менеджер {mid} удалён")
             return True
+        if text.startswith("/max_file "):
+            parts = text.split(maxsplit=2)
+            if len(parts) != 3 or not parts[1].isdigit():
+                await self.tg.message(int(uid), "Формат: /max_file ID имя_файла.mp4")
+                return True
+            item = db.get(Material, int(parts[1]))
+            draft = version(db, False)
+            if not item or item.version_id != draft.id:
+                await self.tg.message(int(uid), "Материал не найден в черновике.")
+                return True
+            if media_kind(item) != "video":
+                await self.tg.message(int(uid), "Альтернативное видео можно привязать только к видеоматериалу.")
+                return True
+            root = Path(self.settings.storage_dir).resolve()
+            name = parts[2].strip()
+            candidate = (root / "max" / name).resolve()
+            if (not candidate.is_relative_to(root / "max") or
+                    not candidate.is_file() or candidate.suffix.lower() not in (".mp4", ".mov", ".mkv", ".webm") or
+                    candidate.stat().st_size > MAX_VIDEO_SIZE):
+                await self.tg.message(int(uid), "Файл не найден в data/materials/max/ или превышает 250 МБ.")
+                return True
+            set_material_refs(item, max_path=str(candidate))
+            item.max_token = ""
+            await self.tg.message(int(uid), f"MAX-видео для материала #{item.id} обновлено. Опубликуйте черновик.")
+            return True
         if text == "/versions":
             past = db.scalars(select(MaterialVersion).order_by(MaterialVersion.id.desc()).limit(8)).all()
             buttons = [[{"text": f"Версия {v.id}{' (опубликована)' if v.published else ''}",
@@ -380,6 +451,9 @@ class SupportService:
             [{"text": "➕ Текст", "callback_data": "adm:add_text"},
              {"text": "➕ Ссылка", "callback_data": "adm:add_link"}],
             [{"text": "📎 Файл/фото/видео", "callback_data": "adm:add_file"}],
+            [{"text": "🎬 Видео после кнопки", "callback_data": "adm:add_gated_video"}],
+            [{"text": "🗣 Текст приглашения", "callback_data": "adm:campaign_cta"},
+             {"text": "🔘 Текст кнопки", "callback_data": "adm:campaign_button"}],
             [{"text": "📋 Черновик", "callback_data": "adm:list"},
              {"text": "👁 Предпросмотр", "callback_data": "adm:preview"}],
             [{"text": "🚀 Опубликовать", "callback_data": "adm:publish"}],
@@ -413,12 +487,16 @@ class SupportService:
                 await self.material_list(db, uid)
             return
         operation = action.split(":")[1]
-        if operation in ("greeting", "add_text", "add_link", "add_file"):
+        if operation in ("greeting", "add_text", "add_link", "add_file", "add_gated_video",
+                         "campaign_cta", "campaign_button"):
             self.set_admin_state(db, uid, operation)
             help_text = {"greeting": "Пришлите новый текст приветствия.",
                          "add_text": "Пришлите текст нового материала.",
                          "add_link": "Пришлите HTTPS-ссылку.",
-                         "add_file": "Пришлите фото, видео или документ (до 20 МБ)."}
+                         "add_file": "Пришлите фото, видео или документ (видео Telegram можно до 300 МБ). Подпись укажите в caption.",
+                         "add_gated_video": "Пришлите дополнительное видео, которое будет выдаваться только по кнопке «Посмотреть», с подписью.",
+                         "campaign_cta": "Пришлите текст приглашения перед кнопкой видео.",
+                         "campaign_button": "Пришлите текст кнопки, например «Посмотреть»."}
             await self.tg.message(uid, help_text[operation])
         elif operation == "list":
             await self.material_list(db, uid)
@@ -461,12 +539,20 @@ class SupportService:
         if action == "search":
             await self.search(db, uid, value)
             return
+        if action in ("campaign_cta", "campaign_button"):
+            if not value:
+                await self.tg.message(uid, "Пришлите непустой текст.")
+                return
+            set_setting(db, action, value)
+            await self.tg.message(uid, "Текст сохранён. Следующие выдачи используют новую настройку.")
+            return
         draft = version(db, False)
         if action.startswith("edit:"):
             m = db.get(Material, int(action.split(":")[1]))
-            if m and m.version_id == draft.id and m.kind in ("text", "link"):
-                m.text = value
-                await self.tg.message(uid, "Материал изменён в черновике.")
+            if m and m.version_id == draft.id:
+                if media_kind(m) in ("text", "link") or value:
+                    m.text = value
+                    await self.tg.message(uid, "Текст или подпись материала изменены в черновике.")
             return
         if action == "add_link" and not re.fullmatch(r"https://[^\s]{3,2000}", value):
             await self.tg.message(uid, "Пришлите ссылку, начинающуюся с https://")
@@ -474,23 +560,38 @@ class SupportService:
         if action in ("add_text", "add_link") and not value:
             await self.tg.message(uid, "Нужно непустое содержимое.")
             return
-        if action == "add_file":
+        if action in ("add_file", "add_gated_video"):
             attachment = tg_attachment(msg)
             if not attachment:
                 await self.tg.message(uid, "Нужен файл, фотография или видео.")
                 return
             kind, file_id, name = attachment
-            content = await self.tg.file_bytes(file_id, MAX_SIZE)
+            if action == "add_gated_video":
+                if kind != "video":
+                    await self.tg.message(uid, "Для материала после кнопки пришлите именно видео.")
+                    return
+                kind = "gated_video"
             folder = Path(self.settings.storage_dir)
             folder.mkdir(parents=True, exist_ok=True)
             safe_name = Path(name).name[:120]
-            path = folder / f"{uuid.uuid4().hex}_{safe_name}"
-            path.write_bytes(content)
+            refs = {"tg_file_id": file_id}
+            part = msg.get(kind.removeprefix("gated_"), {}) or {}
+            declared_size = part.get("file_size") if isinstance(part, dict) else None
+            if declared_size is None or declared_size <= MAX_SIZE:
+                try:
+                    content = await self.tg.file_bytes(file_id, MAX_SIZE)
+                    path = folder / f"{uuid.uuid4().hex}_{safe_name}"
+                    path.write_bytes(content)
+                    refs["local_path"] = str(path)
+                except PlatformError as exc:
+                    if "слишком большой" not in str(exc).lower() and "превышает" not in str(exc).lower():
+                        raise
             value = msg.get("caption") or ""
             name = safe_name
+            path = json.dumps(refs, ensure_ascii=False)
         else:
             kind, path, name = action.removeprefix("add_"), "", ""
-        if action not in ("add_text", "add_link", "add_file"):
+        if action not in ("add_text", "add_link", "add_file", "add_gated_video"):
             return
         position = (max((m.position for m in materials(db, draft)), default=0) + 10)
         db.add(Material(version_id=draft.id, position=position, kind=kind,
@@ -508,17 +609,15 @@ class SupportService:
             buttons = [[{"text": "↑", "callback_data": f"m:up:{item.id}"},
                         {"text": "↓", "callback_data": f"m:down:{item.id}"},
                         {"text": "Удалить", "callback_data": f"m:delete:{item.id}"}]]
-            if item.kind in ("text", "link"):
-                buttons.append([{"text": "Редактировать", "callback_data": f"m:edit:{item.id}"}])
+            buttons.append([{"text": "Изменить текст/подпись", "callback_data": f"m:edit:{item.id}"}])
             await self.tg.message(uid, f"{i+1}. [{item.kind}] {label}", keyboard=buttons)
 
     async def send_material_preview(self, db, uid):
         for m in materials(db, version(db, False)):
             if m.kind in ("text", "link"):
                 await self.tg.message(uid, m.text)
-            elif m.filepath and Path(m.filepath).exists():
-                await self.tg.media(uid, m.kind, Path(m.filepath).read_bytes(),
-                                    m.text, name=m.filename)
+            else:
+                await self.send_tg_material(uid, m)
 
     async def search(self, db, uid, query):
         if not query:
@@ -556,6 +655,9 @@ class SupportService:
         kind = payload.get("kind")
         if kind == "tgcopy":
             await self.tg.copy(int(c.external_id), payload["from_chat"], payload["message_id"])
+        elif kind == "campaign_cta":
+            await self.tg.message(int(c.external_id), payload["text"], keyboard=[[{
+                "text": payload["button"], "callback_data": "client:watch_more"}]])
         elif kind == "material":
             m = db.get(Material, payload["material_id"])
             if m:
@@ -566,33 +668,46 @@ class SupportService:
             await self.tg.message(int(c.external_id), payload.get("text", ""))
 
     async def send_tg_material(self, uid, m):
-        if m.kind in ("text", "link"):
+        kind = media_kind(m)
+        if kind in ("text", "link"):
             await self.tg.message(int(uid), m.text)
-        elif m.filepath and Path(m.filepath).exists():
-            await self.tg.media(int(uid), m.kind, Path(m.filepath).read_bytes(), m.text,
-                                name=m.filename)
-        else:
-            raise PlatformError("Отсутствует файл материала", False)
+            return
+        refs = material_refs(m)
+        if refs.get("tg_file_id"):
+            # sendVideo(file_id) is a NEW message, not a forwarded post.
+            await self.tg.media(int(uid), kind, refs["tg_file_id"], m.text, name=m.filename)
+            return
+        path = local_material_path(m)
+        if path and path.is_file():
+            await self.tg.media(int(uid), kind, path.read_bytes(), m.text, name=m.filename)
+            return
+        raise PlatformError("Не найден файл материала для Telegram", False)
 
     async def deliver_max(self, db, c, payload):
         kind = payload.get("kind")
         if kind == "welcome":
             await self.mx.send(c.external_id, payload["text"], buttons=max_menu(self.settings.ui_language))
+        elif kind == "campaign_cta":
+            await self.mx.send(c.external_id, payload["text"], buttons=[[
+                {"type": "callback", "text": payload["button"], "payload": "client:watch_more"}]])
         elif kind == "material":
             m = db.get(Material, payload["material_id"])
             if m:
-                if m.kind in ("text", "link"):
+                actual_kind = media_kind(m)
+                if actual_kind in ("text", "link"):
                     await self.mx.send(c.external_id, m.text)
                 else:
                     if not m.max_token:
-                        path = Path(m.filepath)
-                        if not path.exists():
-                            raise PlatformError("Отсутствует файл материала", False)
-                        m.max_token = await self.mx.upload(m.kind, path.read_bytes(), m.filename)
-                        db.commit()  # Keep the upload token even if attachment processing is delayed.
+                        path = local_material_path(m, for_max=True)
+                        if not path or not path.is_file():
+                            raise PlatformError(f"Нет MAX-файла для материала #{m.id}; добавьте через /max_file", False)
+                        if actual_kind == "video" and path.stat().st_size > MAX_VIDEO_SIZE:
+                            raise PlatformError("MAX видео превышает 250 МБ", False)
+                        m.max_token = await self.mx.upload(actual_kind, path, m.filename)
+                        db.commit()
                     from .platforms import MAX_UPLOAD_TYPES
                     await self.mx.send(c.external_id, m.text,
-                                       media=(MAX_UPLOAD_TYPES[m.kind], m.max_token))
+                                       media=(MAX_UPLOAD_TYPES[actual_kind], m.max_token))
         elif kind == "tgmedia":
             media_bytes = await self.tg.file_bytes(payload["file_id"], MAX_SIZE)
             token = await self.mx.upload(payload["media_kind"], media_bytes, payload["filename"])
